@@ -1,0 +1,1861 @@
+import mongoose, { overwriteMiddlewareResult } from "mongoose";
+import dotenv from 'dotenv';/*configuration */dotenv.config();
+
+const mongo_uri = process.env.MONGO_URI;
+
+// create a function to handle db connection 
+
+async function databaseConnection (){
+    try{
+        await mongoose.connect(mongo_uri);
+        console.log(`Database connection successfull`);
+    }catch(error){
+        console.error(`Error connecting with the database`, error);
+    }
+}
+
+export{databaseConnection}; for dbConnection.js
+// src/config/mpesaConfig.js
+import dotenv from 'dotenv';
+dotenv.config();
+
+export const mpesaConfig = {
+  consumerKey: process.env.MPESA_CONSUMER_KEY,
+  consumerSecret: process.env.MPESA_CONSUMER_SECRET,
+  passKey: process.env.MPESA_PASSKEY,
+  shortCode: process.env.MPESA_SHORTCODE,
+  environment: process.env.MPESA_ENV || 'sandbox', // 'sandbox' or 'production'
+  
+  // URLs
+  get authUrl() {
+    return this.environment === 'sandbox' 
+      ? 'https://sandbox.safaricom.co.ke/oauth/v1/generate?grant_type=client_credentials'
+      : 'https://api.safaricom.co.ke/oauth/v1/generate?grant_type=client_credentials';
+  },
+  
+  get stkUrl() {
+    return this.environment === 'sandbox'
+      ? 'https://sandbox.safaricom.co.ke/mpesa/stkpush/v1/processrequest'
+      : 'https://api.safaricom.co.ke/mpesa/stkpush/v1/processrequest';
+  },
+  
+  get queryUrl() {
+    return this.environment === 'sandbox'
+      ? 'https://sandbox.safaricom.co.ke/mpesa/stkpushquery/v1/query'
+      : 'https://api.safaricom.co.ke/mpesa/stkpushquery/v1/query';
+  }
+};for mpesaConfig.js
+// test-connection.js
+import mongoose from 'mongoose';
+import dotenv from 'dotenv';
+dotenv.config();
+
+const mongo_uri = process.env.MONGO_URI;
+
+console.log('Testing connection to:', mongo_uri);
+
+mongoose.connect(mongo_uri, {
+  useNewUrlParser: true,
+  useUnifiedTopology: true,
+  serverSelectionTimeoutMS: 5000
+})
+.then(() => {
+  console.log('✅ MongoDB connected successfully!');
+  mongoose.disconnect();
+})
+.catch(err => {
+  console.error('❌ MongoDB connection failed:');
+  console.error('Error name:', err.name);
+  console.error('Error message:', err.message);
+  console.error('Full error:', err);
+});for testing
+ next are the controllers
+ //dependancies
+ import bcrypt from "bcrypt";
+ import jwt from "jsonwebtoken";
+ import dotenv from "dotenv";
+ /*dotenv configuratio */ dotenv.config();
+ 
+ //model
+ import User from "../models/userModel.js";
+ 
+ const register = async (req, res) => {
+   try {
+     const { username, password, role } = req.body;
+ 
+     if (!username || !password) {
+       return res.status(400).json({ message: "Username and password are required" });
+     }
+ 
+     const allowedRoles = ["admin", "manager", "user"];
+     const userRole = allowedRoles.includes(role) ? role : "user";
+ 
+     const existing = await User.findOne({ username });
+     if (existing) {
+       return res.status(400).json({ message: "Username already taken" });
+     }
+ 
+     const hashedPassword = await bcrypt.hash(password, 10);
+     const newUser = new User({
+       username: username.trim(),
+       password: hashedPassword,
+       role: userRole,
+     });
+     await newUser.save();
+ 
+     res.status(201).json({ message: "User registered successfully" });
+   } catch (error) {
+     console.error("Register error:", error);
+     res.status(500).json({ message: "Error registering user" });
+   }
+ };
+ 
+ const login = async (req, res) => {
+   try {
+     const { username, password } = req.body;
+ 
+     if (!username || !password) {
+       return res.status(400).json({ message: "Username and password are required" });
+     }
+ 
+     const user = await User.findOne({ username: username.trim() });
+     if (!user) {
+       return res.status(400).json({ message: "Invalid credentials" });
+     }
+ 
+     const isMatch = await bcrypt.compare(password, user.password);
+     if (!isMatch) {
+       return res.status(400).json({ message: "Invalid credentials" });
+     }
+ 
+     const token = jwt.sign(
+       { id: user._id, role: user.role },
+       process.env.JWT_SECRET,
+       { expiresIn: "7d" },
+     );
+ 
+     res.status(200).json({
+       token,
+       role: user.role,
+       username: user.username,
+       id: user._id,
+     });
+   } catch (error) {
+     console.error("Login error:", error);
+     res.status(500).json({ message: "Something went wrong when logging in" });
+   }
+ };
+ 
+ export { register, login };
+  auth conntrollers
+  // src/controllers/paymentController.js
+  import mpesaService from '../services/mpesaService.js';
+  import Payment from '../models/paymentModel.js';
+  import Unit from '../models/unitModel.js';
+  import User from '../models/userModel.js';
+  import Property from '../models/propertyModel.js';
+  
+  // Initiate STK Push payment
+  export const initiatePayment = async (req, res) => {
+    try {
+      const { amount, phoneNumber } = req.body;
+      const tenantId = req.user.id;
+  
+      // Get tenant details
+      const tenant = await User.findById(tenantId);
+      if (!tenant || tenant.role !== 'user') {
+        return res.status(404).json({ message: 'Tenant not found' });
+      }
+  
+      // Find tenant's unit
+      const unit = await Unit.findOne({ tenant: tenantId }).populate('property');
+      if (!unit) {
+        return res.status(404).json({ message: 'No unit assigned to this tenant' });
+      }
+  
+      // Create payment record
+      const payment = await Payment.create({
+        tenant: tenantId,
+        unit: unit._id,
+        property: unit.property._id,
+        amount,
+        phoneNumber,
+        accountReference: `RENT-${unit.unitNumber}`,
+        transactionDesc: `Rent payment for Unit ${unit.unitNumber}`
+      });
+  
+      // Callback URL (your ngrok or production URL)
+      const baseUrl = process.env.BASE_URL || 'http://localhost:8005';
+      const callbackUrl = `${baseUrl}/api/payments/mpesa-callback`;
+  
+      // Initiate STK Push
+      const stkResponse = await mpesaService.stkPush(
+        phoneNumber,
+        amount,
+        payment.accountReference,
+        payment.transactionDesc,
+        callbackUrl
+      );
+  
+      // Update payment with M-Pesa request IDs
+      payment.checkoutRequestID = stkResponse.CheckoutRequestID;
+      payment.merchantRequestID = stkResponse.MerchantRequestID;
+      await payment.save();
+  
+      res.status(200).json({
+        success: true,
+        message: 'STK Push initiated. Check your phone to complete payment.',
+        data: {
+          checkoutRequestID: stkResponse.CheckoutRequestID,
+          merchantRequestID: stkResponse.MerchantRequestID,
+          paymentId: payment._id
+        }
+      });
+  
+    } catch (error) {
+      console.error('Payment initiation error:', error);
+      res.status(500).json({ 
+        success: false, 
+        message: error.message || 'Failed to initiate payment' 
+      });
+    }
+  };
+  
+  // M-Pesa callback handler
+  export const mpesaCallback = async (req, res) => {
+    try {
+      console.log('M-Pesa Callback received:', JSON.stringify(req.body, null, 2));
+  
+      const { Body } = req.body;
+      
+      if (!Body || !Body.stkCallback) {
+        return res.status(400).json({ message: 'Invalid callback data' });
+      }
+  
+      const { stkCallback } = Body;
+      const {
+        MerchantRequestID,
+        CheckoutRequestID,
+        ResultCode,
+        ResultDesc,
+        CallbackMetadata
+      } = stkCallback;
+  
+      // Find payment by CheckoutRequestID
+      const payment = await Payment.findOne({ checkoutRequestID: CheckoutRequestID });
+      
+      if (!payment) {
+        console.error('Payment not found for CheckoutRequestID:', CheckoutRequestID);
+        return res.status(404).json({ message: 'Payment not found' });
+      }
+  
+      // Update payment status
+      payment.resultCode = ResultCode;
+      payment.resultDesc = ResultDesc;
+      payment.status = ResultCode === 0 ? 'completed' : 'failed';
+  
+      // If successful, extract metadata
+      if (ResultCode === 0 && CallbackMetadata && CallbackMetadata.Item) {
+        const metadata = CallbackMetadata.Item;
+        
+        metadata.forEach(item => {
+          switch (item.Name) {
+            case 'Amount':
+              payment.amount = item.Value;
+              break;
+            case 'MpesaReceiptNumber':
+              payment.mpesaReceiptNumber = item.Value;
+              payment.transactionId = item.Value;
+              break;
+            case 'TransactionDate':
+              payment.paymentDate = new Date(item.Value.toString().substring(0, 4) + '-' +
+                                            item.Value.toString().substring(4, 6) + '-' +
+                                            item.Value.toString().substring(6, 8) + 'T' +
+                                            item.Value.toString().substring(8, 10) + ':' +
+                                            item.Value.toString().substring(10, 12) + ':' +
+                                            item.Value.toString().substring(12, 14));
+              break;
+            case 'PhoneNumber':
+              payment.phoneNumber = item.Value;
+              break;
+          }
+        });
+      }
+  
+      await payment.save();
+  
+      // Always respond with success to M-Pesa
+      res.status(200).json({ 
+        ResultCode: 0, 
+        ResultDesc: "Callback received successfully" 
+      });
+  
+    } catch (error) {
+      console.error('Callback processing error:', error);
+      // Still return 200 to acknowledge receipt
+      res.status(200).json({ 
+        ResultCode: 0, 
+        ResultDesc: "Callback received" 
+      });
+    }
+  };
+  
+  // Get tenant payment history
+  export const getPaymentHistory = async (req, res) => {
+    try {
+      const tenantId = req.user.id;
+      
+      const payments = await Payment.find({ tenant: tenantId })
+        .populate('unit', 'unitNumber')
+        .populate('property', 'propertyName')
+        .sort({ createdAt: -1 });
+  
+      res.status(200).json(payments);
+    } catch (error) {
+      console.error('Error fetching payment history:', error);
+      res.status(500).json({ message: 'Failed to fetch payment history' });
+    }
+  };
+  
+  // Get all payments (admin only)
+  export const getAllPayments = async (req, res) => {
+    try {
+      const payments = await Payment.find()
+        .populate('tenant', 'username')
+        .populate('unit', 'unitNumber')
+        .populate('property', 'propertyName')
+        .sort({ createdAt: -1 });
+  
+      res.status(200).json(payments);
+    } catch (error) {
+      console.error('Error fetching all payments:', error);
+      res.status(500).json({ message: 'Failed to fetch payments' });
+    }
+  };
+  
+  // Query transaction status
+  export const queryPaymentStatus = async (req, res) => {
+    try {
+      const { checkoutRequestID } = req.params;
+      
+      const payment = await Payment.findOne({ checkoutRequestID });
+      if (!payment) {
+        return res.status(404).json({ message: 'Payment not found' });
+      }
+  
+      const status = await mpesaService.queryStatus(checkoutRequestID);
+      
+      res.status(200).json({
+        payment,
+        mpesaStatus: status
+      });
+    } catch (error) {
+      console.error('Error querying status:', error);
+      res.status(500).json({ message: 'Failed to query payment status' });
+    }
+  }; ppaymentcontroller
+  // controllers/propertyController.js
+  import Property from "../models/propertyModel.js";
+  import Unit from "../models/unitModel.js";
+  import User from "../models/userModel.js"; // Import User at the top
+  
+  // CREATE a new property
+  const createProperty = async (req, res) => {
+    try {
+      const { propertyName, numberOfUnits } = req.body;
+      
+      if (!propertyName || !numberOfUnits) {
+        return res.status(400).json({ 
+          message: "Property name and number of units are required" 
+        });
+      }
+  
+      if (numberOfUnits < 1) {
+        return res.status(400).json({ 
+          message: "Number of units must be at least 1" 
+        });
+      }
+  
+      const newProperty = await Property.create({
+        propertyName: propertyName.trim(),
+        propertyOwner: req.user.id,
+        numberOfUnits,
+      });
+      
+      res.status(201).json(newProperty);
+    } catch (error) {
+      console.error("Create property error:", error);
+      res.status(500).json({ message: "Failed to create property" });
+    }
+  };
+  
+  // GET all properties for the logged-in admin
+  const getMyProperties = async (req, res) => {
+    try {
+      const properties = await Property.find({ propertyOwner: req.user.id });
+      res.json(properties);
+    } catch (error) {
+      console.error("Get properties error:", error);
+      res.status(500).json({ message: "Failed to fetch properties" });
+    }
+  };
+  
+  // GET a single property by ID
+  const getOneProperty = async (req, res) => {
+    try {
+      const { id } = req.params;
+      
+      const property = await Property.findOne({
+        _id: id,
+        propertyOwner: req.user.id,
+      });
+      
+      if (!property) {
+        return res.status(404).json({ message: "Property not found" });
+      }
+      
+      res.json(property);
+    } catch (error) {
+      console.error("Get property error:", error);
+      res.status(500).json({ message: "Failed to fetch property" });
+    }
+  };
+  
+  // UPDATE a property
+  const updateProperty = async (req, res) => {
+    try {
+      const { id } = req.params;
+      const { propertyName, numberOfUnits } = req.body;
+  
+      const property = await Property.findOne({
+        _id: id,
+        propertyOwner: req.user.id,
+      });
+  
+      if (!property) {
+        return res.status(404).json({ message: "Property not found" });
+      }
+  
+      if (numberOfUnits !== undefined) {
+        if (numberOfUnits < 1) {
+          return res.status(400).json({ 
+            message: "Number of units must be at least 1" 
+          });
+        }
+  
+        const currentUnitsCount = await Unit.countDocuments({ property: id });
+        
+        if (numberOfUnits < currentUnitsCount) {
+          return res.status(400).json({ 
+            message: `Cannot reduce number of units to ${numberOfUnits} because this property already has ${currentUnitsCount} units. Delete some units first.` 
+          });
+        }
+      }
+  
+      const updateData = {};
+      if (propertyName !== undefined) updateData.propertyName = propertyName.trim();
+      if (numberOfUnits !== undefined) updateData.numberOfUnits = numberOfUnits;
+  
+      const updatedProperty = await Property.findOneAndUpdate(
+        { _id: id, propertyOwner: req.user.id },
+        { $set: updateData },
+        { new: true, runValidators: true }
+      );
+      
+      res.json(updatedProperty);
+    } catch (error) {
+      console.error("Update property error:", error);
+      res.status(500).json({ message: "Failed to update property" });
+    }
+  };
+  
+  // DELETE a property
+  const deleteProperty = async (req, res) => {
+    try {
+      const { id } = req.params;
+      
+      const property = await Property.findOne({
+        _id: id,
+        propertyOwner: req.user.id,
+      });
+  
+      if (!property) {
+        return res.status(404).json({ message: "Property not found" });
+      }
+  
+      const unitCount = await Unit.countDocuments({ property: id });
+      
+      if (unitCount > 0) {
+        return res.status(400).json({ 
+          message: `Cannot delete this property because it has ${unitCount} units. Please delete all units first.` 
+        });
+      }
+  
+      await Property.findByIdAndDelete(id);
+      
+      res.json({ message: "Property deleted successfully" });
+    } catch (error) {
+      console.error("Delete property error:", error);
+      res.status(500).json({ message: "Failed to delete property" });
+    }
+  };
+  
+  // ============ MANAGER FUNCTIONS (defined once) ============
+  
+  // Get available managers (users with role "manager" not assigned to any property)
+  const getAvailableManagers = async (req, res) => {
+    try {
+      // Get all managers that are already assigned to properties
+      const assignedManagers = await Property.distinct('manager', { manager: { $ne: null } });
+      
+      // Get all users with role "manager" that are not assigned
+      const availableManagers = await User.find({
+        role: "manager",
+        _id: { $nin: assignedManagers }
+      }).select('username');
+  
+      res.json(availableManagers);
+    } catch (error) {
+      console.error("Error fetching available managers:", error);
+      res.status(500).json({ message: "Failed to fetch available managers" });
+    }
+  };
+  
+  // Assign manager to property
+  const assignManager = async (req, res) => {
+    try {
+      const { id } = req.params;
+      const { managerId } = req.body;
+  
+      // Check if property exists and belongs to admin
+      const property = await Property.findOne({
+        _id: id,
+        propertyOwner: req.user.id,
+      });
+  
+      if (!property) {
+        return res.status(403).json({ message: "Not authorized or property not found" });
+      }
+  
+      // Check if manager exists and has role "manager"
+      const manager = await User.findOne({
+        _id: managerId,
+        role: "manager"
+      });
+  
+      if (!manager) {
+        return res.status(404).json({ message: "Manager not found or invalid role" });
+      }
+  
+      // Check if manager is already assigned to another property
+      const existingAssignment = await Property.findOne({
+        manager: managerId,
+        _id: { $ne: id }
+      });
+  
+      if (existingAssignment) {
+        return res.status(400).json({ 
+          message: "This manager is already assigned to another property" 
+        });
+      }
+  
+      // Assign manager
+      property.manager = managerId;
+      await property.save();
+  
+      res.json({ 
+        message: "Manager assigned successfully", 
+        property 
+      });
+    } catch (error) {
+      console.error("Error assigning manager:", error);
+      res.status(500).json({ message: "Failed to assign manager" });
+    }
+  };
+  
+  // Remove manager from property
+  const removeManager = async (req, res) => {
+    try {
+      const { id } = req.params;
+  
+      const property = await Property.findOneAndUpdate(
+        { _id: id, propertyOwner: req.user.id },
+        { manager: null },
+        { new: true }
+      );
+  
+      if (!property) {
+        return res.status(404).json({ message: "Property not found" });
+      }
+  
+      res.json({ message: "Manager removed successfully", property });
+    } catch (error) {
+      console.error("Error removing manager:", error);
+      res.status(500).json({ message: "Failed to remove manager" });
+    }
+  };
+  
+  // ============ EXPORT ALL FUNCTIONS ============
+  export { 
+    createProperty, 
+    getMyProperties, 
+    getOneProperty, 
+    updateProperty, 
+    deleteProperty,
+    assignManager,
+    removeManager,
+    getAvailableManagers
+  }; propertyController
+  // controllers/unitController.js
+  import Unit from "../models/unitModel.js";
+  import Property from "../models/propertyModel.js";
+  import User from "../models/userModel.js";
+  
+  // Create a new unit
+  const createUnit = async (req, res) => {
+    try {
+      console.log("Create Unit called", { user: req.user, params: req.params, body: req.body });
+  
+      const { unitNumber, rent, status } = req.body;
+      const { propertyId } = req.params;
+  
+      // Validate input
+      if (!unitNumber || !rent) {
+        return res.status(400).json({ 
+          message: "Unit number and rent are required" 
+        });
+      }
+  
+      // Check property exists and belongs to admin
+      const property = await Property.findOne({
+        _id: propertyId,
+        propertyOwner: req.user.id,
+      });
+  
+      if (!property) {
+        return res.status(403).json({ message: "Not authorized or property not found" });
+      }
+  
+      // Check if property has reached maximum units
+      const unitCount = await Unit.countDocuments({ property: propertyId });
+      if (unitCount >= property.numberOfUnits) {
+        return res.status(400).json({ 
+          message: `Maximum number of units (${property.numberOfUnits}) reached for this property` 
+        });
+      }
+  
+      // Create the unit
+      const unit = await Unit.create({
+        unitNumber: unitNumber.trim(),
+        rent: Number(rent),
+        status: status || "vacant",
+        property: propertyId,
+      });
+  
+      res.status(201).json(unit);
+    } catch (error) {
+      console.error("Create unit error:", error);
+      
+      // Handle duplicate key error
+      if (error.code === 11000) {
+        return res.status(400).json({ 
+          message: "Unit number already exists in this property" 
+        });
+      }
+      
+      res.status(500).json({ message: "Failed to create unit" });
+    }
+  };
+  
+  // Get all units for a property
+  const getPropertyUnits = async (req, res) => {
+    try {
+      const { propertyId } = req.params;
+      
+      console.log("🔍 Getting units for property:", propertyId);
+      console.log("🔍 User:", req.user.id);
+  
+      // Check if property exists and belongs to admin
+      const property = await Property.findOne({
+        _id: propertyId,
+        propertyOwner: req.user.id,
+      });
+  
+      if (!property) {
+        console.log("❌ Property not found or not authorized");
+        return res.status(403).json({ message: "Not authorized" });
+      }
+  
+      console.log("✅ Property found:", property.propertyName);
+  
+      // Get units with tenant info
+      const units = await Unit.find({ property: propertyId })
+        .populate('tenant', 'username')
+        .sort({ unitNumber: 1 });
+  
+      console.log(`✅ Found ${units.length} units`);
+  
+      res.json({
+        property: {
+          id: property._id,
+          name: property.propertyName,
+          totalUnits: property.numberOfUnits,
+          currentUnits: units.length
+        },
+        units
+      });
+    } catch (error) {
+      console.error("❌ Get units error:", error);
+      res.status(500).json({ message: "Failed to fetch units" });
+    }
+  };
+  
+  // Update a unit
+  const updateUnit = async (req, res) => {
+    try {
+      const { propertyId, unitId } = req.params;
+      const { unitNumber, rent, status } = req.body;
+  
+      // Check property ownership
+      const property = await Property.findOne({
+        _id: propertyId,
+        propertyOwner: req.user.id,
+      });
+  
+      if (!property) {
+        return res.status(403).json({ message: "Not authorized" });
+      }
+  
+      // Build update object
+      const updateFields = {};
+      if (unitNumber !== undefined) updateFields.unitNumber = unitNumber.trim();
+      if (rent !== undefined) updateFields.rent = Number(rent);
+      if (status !== undefined) updateFields.status = status;
+  
+      // Update unit
+      const unit = await Unit.findOneAndUpdate(
+        { _id: unitId, property: propertyId },
+        { $set: updateFields },
+        { new: true, runValidators: true }
+      ).populate('tenant', 'username');
+  
+      if (!unit) {
+        return res.status(404).json({ message: "Unit not found" });
+      }
+  
+      res.json(unit);
+    } catch (error) {
+      console.error("Update unit error:", error);
+      
+      if (error.code === 11000) {
+        return res.status(400).json({ 
+          message: "Unit number already exists in this property" 
+        });
+      }
+      
+      res.status(500).json({ message: "Failed to update unit" });
+    }
+  };
+  
+  // Delete a unit
+  const deleteUnit = async (req, res) => {
+    try {
+      const { propertyId, unitId } = req.params;
+  
+      // Check property ownership
+      const property = await Property.findOne({
+        _id: propertyId,
+        propertyOwner: req.user.id,
+      });
+  
+      if (!property) {
+        return res.status(403).json({ message: "Not authorized" });
+      }
+  
+      // Check if unit has a tenant
+      const unit = await Unit.findOne({ _id: unitId, property: propertyId });
+      
+      if (!unit) {
+        return res.status(404).json({ message: "Unit not found" });
+      }
+  
+      if (unit.tenant) {
+        return res.status(400).json({ 
+          message: "Cannot delete unit with an assigned tenant. Remove tenant first." 
+        });
+      }
+  
+      await Unit.findByIdAndDelete(unitId);
+  
+      res.json({ message: "Unit deleted successfully" });
+    } catch (error) {
+      console.error("Delete unit error:", error);
+      res.status(500).json({ message: "Failed to delete unit" });
+    }
+  };
+  
+  // Assign a tenant to a unit
+  const assignTenantToUnit = async (req, res) => {
+    try {
+      const { propertyId, unitId } = req.params;
+      const { tenantId } = req.body;
+  
+      // Check property ownership
+      const property = await Property.findOne({
+        _id: propertyId,
+        propertyOwner: req.user.id,
+      });
+  
+      if (!property) {
+        return res.status(403).json({ message: "Not authorized" });
+      }
+  
+      // Check if unit exists
+      const unit = await Unit.findOne({
+        _id: unitId,
+        property: propertyId,
+      });
+  
+      if (!unit) {
+        return res.status(404).json({ message: "Unit not found" });
+      }
+  
+      // Check if unit already has a tenant
+      if (unit.tenant) {
+        return res.status(400).json({ 
+          message: "This unit already has a tenant. Remove current tenant first." 
+        });
+      }
+  
+      // Check if user exists and has role "user"
+      const tenant = await User.findOne({
+        _id: tenantId,
+        role: "user"
+      });
+  
+      if (!tenant) {
+        return res.status(404).json({ 
+          message: "Tenant not found or user does not have 'user' role" 
+        });
+      }
+  
+      // Check if tenant is already assigned to another unit
+      const existingAssignment = await Unit.findOne({
+        tenant: tenantId,
+        _id: { $ne: unitId }
+      });
+  
+      if (existingAssignment) {
+        return res.status(400).json({ 
+          message: "This tenant is already assigned to another unit" 
+        });
+      }
+  
+      // Assign tenant to unit
+      unit.tenant = tenantId;
+      unit.status = "occupied";
+      await unit.save();
+  
+      const updatedUnit = await Unit.findById(unitId)
+        .populate('tenant', 'username');
+  
+      res.json({ 
+        message: "Tenant assigned successfully", 
+        unit: updatedUnit 
+      });
+    } catch (error) {
+      console.error("Assign tenant error:", error);
+      res.status(500).json({ message: "Failed to assign tenant" });
+    }
+  };
+  
+  // Remove tenant from unit
+  const removeTenantFromUnit = async (req, res) => {
+    try {
+      const { propertyId, unitId } = req.params;
+  
+      // Check property ownership
+      const property = await Property.findOne({
+        _id: propertyId,
+        propertyOwner: req.user.id,
+      });
+  
+      if (!property) {
+        return res.status(403).json({ message: "Not authorized" });
+      }
+  
+      // Remove tenant from unit
+      const unit = await Unit.findOneAndUpdate(
+        { _id: unitId, property: propertyId },
+        { 
+          tenant: null,
+          status: "vacant" 
+        },
+        { new: true }
+      );
+  
+      if (!unit) {
+        return res.status(404).json({ message: "Unit not found" });
+      }
+  
+      res.json({ 
+        message: "Tenant removed successfully", 
+        unit 
+      });
+    } catch (error) {
+      console.error("Remove tenant error:", error);
+      res.status(500).json({ message: "Failed to remove tenant" });
+    }
+  };
+  
+  // Get available tenants (users with role "user" not assigned to any unit)
+  const getAvailableTenants = async (req, res) => {
+    try {
+      // Get all users with role "user"
+      const allUsers = await User.find({ role: "user" }).select('username');
+      
+      // Get IDs of users already assigned as tenants
+      const assignedTenantIds = await Unit.distinct('tenant', { tenant: { $ne: null } });
+      
+      // Filter out assigned users
+      const availableTenants = allUsers.filter(
+        user => !assignedTenantIds.some(id => id && id.toString() === user._id.toString())
+      );
+  
+      res.json(availableTenants);
+    } catch (error) {
+      console.error("Get available tenants error:", error);
+      res.status(500).json({ message: "Failed to fetch available tenants" });
+    }
+  };
+  
+  // Get tenant details for a specific unit
+  const getUnitTenant = async (req, res) => {
+    try {
+      const { propertyId, unitId } = req.params;
+  
+      // Check property ownership
+      const property = await Property.findOne({
+        _id: propertyId,
+        propertyOwner: req.user.id,
+      });
+  
+      if (!property) {
+        return res.status(403).json({ message: "Not authorized" });
+      }
+  
+      const unit = await Unit.findOne({ _id: unitId, property: propertyId })
+        .populate('tenant', 'username');
+  
+      if (!unit) {
+        return res.status(404).json({ message: "Unit not found" });
+      }
+  
+      if (!unit.tenant) {
+        return res.status(404).json({ message: "No tenant assigned to this unit" });
+      }
+  
+      res.json(unit.tenant);
+    } catch (error) {
+      console.error("Get unit tenant error:", error);
+      res.status(500).json({ message: "Failed to fetch tenant" });
+    }
+  };
+  
+  // Get vacant units for a specific property
+  const getVacantUnits = async (req, res) => {
+    try {
+      const { propertyId } = req.params;
+  
+      // Check if property exists and belongs to admin
+      const property = await Property.findOne({
+        _id: propertyId,
+        propertyOwner: req.user.id,
+      });
+  
+      if (!property) {
+        return res.status(403).json({ message: "Not authorized" });
+      }
+  
+      // Get all vacant units
+      const vacantUnits = await Unit.find({ 
+        property: propertyId, 
+        status: "vacant" 
+      }).select('unitNumber rent');
+  
+      res.json(vacantUnits);
+    } catch (error) {
+      console.error("Error fetching vacant units:", error);
+      res.status(500).json({ message: "Failed to fetch vacant units" });
+    }
+  };
+  
+  // Make sure to export it
+  export { 
+    createUnit, 
+    getPropertyUnits, 
+    updateUnit, 
+    deleteUnit,
+    assignTenantToUnit,
+    removeTenantFromUnit,
+    getAvailableTenants,
+    getUnitTenant,
+    getVacantUnits
+  }; unit controller
+
+// controllers/userController.js
+import User from "../models/userModel.js";
+import bcrypt from "bcrypt";
+
+// Get all users
+const getUsers = async (req, res) => {
+  try {
+    const users = await User.find({}).select('-password').populate('property', 'propertyName');
+    res.status(200).json(users);
+  } catch (error) {
+    res.status(500).json({ message: "Error fetching users", error });
+  }
+};
+
+// Get single user
+const getOneUser = async (req, res) => {
+  try {
+    const { id } = req.params;
+    const user = await User.findById(id).select('-password').populate('property', 'propertyName');
+    
+    if (!user) {
+      return res.status(404).json({ message: "User not found" });
+    }
+    
+    res.status(200).json(user);
+  } catch (error) {
+    res.status(500).json({ message: "Error fetching user", error });
+  }
+};
+
+// Create user (admin only) - NOW WITH PROPERTY
+const createUser = async (req, res) => {
+  try {
+    const { username, password, role, propertyId } = req.body;
+
+    console.log("Creating user:", { username, role, propertyId });
+
+    if (!username || !password || !role) {
+      return res.status(400).json({ message: "Username, password and role are required" });
+    }
+
+    // Check if username already exists
+    const existing = await User.findOne({ username });
+    if (existing) {
+      return res.status(400).json({ message: "Username already taken" });
+    }
+
+    // Validate role
+    const allowedRoles = ["admin", "manager", "user"];
+    if (!allowedRoles.includes(role)) {
+      return res.status(400).json({ message: "Invalid role" });
+    }
+
+    // If role is "user" (tenant), propertyId is required
+    if (role === "user" && !propertyId) {
+      return res.status(400).json({ message: "Property is required for tenants" });
+    }
+
+    // If propertyId is provided, check if property exists
+    if (propertyId) {
+      const Property = (await import("../models/propertyModel.js")).default;
+      const property = await Property.findById(propertyId);
+      if (!property) {
+        return res.status(400).json({ message: "Property not found" });
+      }
+    }
+
+    // Hash password
+    const hashedPassword = await bcrypt.hash(password, 10);
+    
+    // Create user
+    const newUser = await User.create({
+      username: username.trim(),
+      password: hashedPassword,
+      role: role,
+      property: role === "user" ? propertyId : null // Only tenants get property
+    });
+
+    // Return user without password
+    const userResponse = newUser.toObject();
+    delete userResponse.password;
+
+    res.status(201).json({
+      message: "User created successfully",
+      user: userResponse
+    });
+  } catch (error) {
+    console.error("Create user error:", error);
+    res.status(500).json({ message: "Error creating user" });
+  }
+};
+
+// Update user
+const updateUser = async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { username, role, propertyId } = req.body;
+
+    const updateData = { username, role };
+    
+    // Update property if provided and role is user
+    if (role === "user" && propertyId) {
+      updateData.property = propertyId;
+    } else if (role !== "user") {
+      updateData.property = null; // Clear property if role changed from user
+    }
+
+    const user = await User.findByIdAndUpdate(
+      id,
+      updateData,
+      { new: true, runValidators: true }
+    ).select('-password').populate('property', 'propertyName');
+
+    if (!user) {
+      return res.status(404).json({ message: "User not found" });
+    }
+
+    res.status(200).json(user);
+  } catch (error) {
+    res.status(500).json({ message: "Error updating user" });
+  }
+};
+
+// Delete user
+const deleteUser = async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    // Check if user is assigned to any unit as tenant
+    const Unit = (await import("../models/unitModel.js")).default;
+    const assignedUnit = await Unit.findOne({ tenant: id });
+    
+    if (assignedUnit) {
+      return res.status(400).json({ 
+        message: "Cannot delete user because they are assigned as a tenant to a unit. Please remove them from the unit first." 
+      });
+    }
+
+    // Check if user is a property owner (manager/admin)
+    const Property = (await import("../models/propertyModel.js")).default;
+    const ownedProperty = await Property.findOne({ propertyOwner: id });
+    
+    if (ownedProperty) {
+      return res.status(400).json({ 
+        message: "Cannot delete user because they own properties. Please reassign properties first." 
+      });
+    }
+
+    const user = await User.findByIdAndDelete(id);
+    
+    if (!user) {
+      return res.status(404).json({ message: "User not found" });
+    }
+
+    res.status(200).json({ message: "User deleted successfully" });
+  } catch (error) {
+    console.error("Delete user error:", error);
+    res.status(500).json({ message: "Error deleting user" });
+  }
+};
+
+// Get users by role (for dropdowns)
+const getUsersByRole = async (req, res) => {
+  try {
+    const { role } = req.params;
+    
+    console.log("Fetching users with role:", role);
+    
+    const allowedRoles = ["admin", "manager", "user"];
+    if (!allowedRoles.includes(role)) {
+      return res.status(400).json({ message: "Invalid role" });
+    }
+
+    const users = await User.find({ role }).select('username property').populate('property', 'propertyName');
+    res.status(200).json(users);
+  } catch (error) {
+    console.error("Error fetching users by role:", error);
+    res.status(500).json({ message: "Error fetching users" });
+  }
+};
+
+// Get tenants by property (for unit assignment)
+const getTenantsByProperty = async (req, res) => {
+  try {
+    const { propertyId } = req.params;
+    
+    console.log("Fetching tenants for property:", propertyId);
+    
+    // Get tenants assigned to this property
+    const tenants = await User.find({ 
+      role: "user",
+      property: propertyId 
+    }).select('username');
+    
+    // Get IDs of tenants already assigned to units in this property
+    const Unit = (await import("../models/unitModel.js")).default;
+    const assignedTenantIds = await Unit.distinct('tenant', { 
+      property: propertyId,
+      tenant: { $ne: null } 
+    });
+    
+    // Filter out tenants already assigned to units
+    const availableTenants = tenants.filter(
+      tenant => !assignedTenantIds.some(id => id && id.toString() === tenant._id.toString())
+    );
+
+    res.json(availableTenants);
+  } catch (error) {
+    console.error("Error fetching tenants by property:", error);
+    res.status(500).json({ message: "Failed to fetch tenants" });
+  }
+};
+
+export { 
+  getUsers, 
+  getOneUser, 
+  createUser, 
+  updateUser, 
+  deleteUser,
+  getUsersByRole,
+  getTenantsByProperty
+}; userController
+
+for overwriteMiddlewareResult    //dependancies
+    import jwt from 'jsonwebtoken';
+    import dotenv from "dotenv";/* dotenv configuration*/ dotenv.config();
+
+    const verifyToken = (req,res,next)=>{
+        let token ;
+        const authHeader = req.headers.authorization || req.headers.Authorization;
+
+        if(authHeader && authHeader.startsWith("Bearer ")){
+            token = authHeader.split(" ")[1];
+        }
+
+        if(!token){
+            return res.status(401).json({message: `No token, Authorization Denied`});
+        }
+    try{
+        const decode = jwt.verify(token, process.env.JWT_SECRET);
+            req.user = decode;
+            console.log("The decoded user is : ", req.user);
+            return next();
+    }catch(error){
+        return res.status(401).json({ message: `Token not valid` });
+    }  
+    }
+
+    export{verifyToken};authmiddleware
+    //role base authorization 
+
+const authorizaRoles = (...allowedRoles/* rest operatror*/)=>{ 
+    return(req,res,next)=>{
+        if(!req.user|| !allowedRoles.includes(req.user.role)){
+            return res.status(403).json({ message:"Access Denied"});
+        }
+        next()// if everything is okay
+    }
+}
+
+export {authorizaRoles};roleMiddleware
+// src/models/paymentModel.js
+import mongoose from 'mongoose';
+
+const paymentSchema = new mongoose.Schema({
+  tenant: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'User',
+    required: true
+  },
+  unit: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'Unit',
+    required: true
+  },
+  property: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'Property',
+    required: true
+  },
+  amount: {
+    type: Number,
+    required: true
+  },
+  phoneNumber: {
+    type: String,
+    required: true
+  },
+  transactionId: {
+    type: String,
+    unique: true,
+    sparse: true
+  },
+  mpesaReceiptNumber: String,
+  checkoutRequestID: String,
+  merchantRequestID: String,
+  status: {
+    type: String,
+    enum: ['pending', 'completed', 'failed', 'cancelled'],
+    default: 'pending'
+  },
+  resultCode: Number,
+  resultDesc: String,
+  paymentDate: Date,
+  paymentMethod: {
+    type: String,
+    default: 'mpesa'
+  },
+  accountReference: String,
+  transactionDesc: String
+}, {
+  timestamps: true
+});
+
+const Payment = mongoose.model('Payment', paymentSchema);
+export default Payment; paymentModel
+// models/propertyModel.js - Add manager field
+import mongoose from 'mongoose';
+
+const propertySchema = new mongoose.Schema(
+    {
+        propertyName: {
+            type: String,
+            required: true,
+            trim: true,
+        },
+        propertyOwner: {
+            type: mongoose.Schema.Types.ObjectId,
+            ref: "User",
+            required: true,
+        },
+        manager: {
+            type: mongoose.Schema.Types.ObjectId,
+            ref: "User",
+            default: null,
+        },
+        numberOfUnits: {
+            type: Number,
+            required: true,
+        }
+    },
+    {
+        timestamps: true,
+    }
+);
+
+const Property = mongoose.model("Property", propertySchema);
+export default Property;propertyModel
+// models/unitModel.js
+import mongoose from "mongoose";
+
+const unitSchema = new mongoose.Schema(
+  {
+    unitNumber: {
+      type: String,
+      required: true,
+    },
+
+    rent: {
+      type: Number,
+      required: true,
+    },
+
+    status: {
+      type: String,
+      enum: ["vacant", "occupied"],
+      default: "vacant",
+    },
+
+    property: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "Property",
+      required: true,
+    },
+
+    tenant: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "User",
+      default: null,
+    },
+  },
+  { 
+    timestamps: true,
+    // Ensure a user can only be tenant of one unit
+    indexes: [
+      { unique: true, partialFilterExpression: { tenant: { $ne: null } } }
+    ]
+  }
+);
+
+// Ensure unique unit numbers per property
+unitSchema.index({ property: 1, unitNumber: 1 }, { unique: true });
+
+const Unit = mongoose.model("Unit", unitSchema);
+export default Unit;unitMoodel
+// models/userModel.js
+import mongoose from 'mongoose';
+
+const userSchema = new mongoose.Schema({
+    username: {
+        type: String,
+        required: true,
+        unique: true
+    },
+    password: {
+        type: String,
+        required: true
+    },
+    role: {
+        type: String,
+        required: true,
+        enum: ["admin", "manager", "user"],
+    },
+    property: {
+        type: mongoose.Schema.Types.ObjectId,
+        ref: "Property",
+        default: null // Only for users with role "user" (tenants)
+    }
+}, {
+    timestamps: true,
+});
+
+const User = mongoose.model("User", userSchema);
+export default User;userModel
+for the routes we have 
+// routes/authRoutes.js
+import express from "express";
+import { register, login } from "../controllers/authController.js";
+
+const router = express.Router();
+
+router.post("/register", register);
+router.post("/login", login);
+
+export default router;auth routes
+// src/routes/paymentRoutes.js
+import express from 'express';
+import { verifyToken } from '../middlewares/authMiddleware.js';
+import { authorizaRoles } from '../middlewares/roleMiddleware.js';
+import {
+  initiatePayment,
+  mpesaCallback,
+  getPaymentHistory,
+  getAllPayments,
+  queryPaymentStatus
+} from '../controllers/paymentController.js';
+
+const router = express.Router();
+
+// Public callback endpoint (M-Pesa calls this)
+router.post('/mpesa-callback', mpesaCallback);
+
+// Protected routes
+router.post('/initiate', verifyToken, authorizaRoles('user'), initiatePayment);
+router.get('/history', verifyToken, authorizaRoles('user'), getPaymentHistory);
+router.get('/status/:checkoutRequestID', verifyToken, queryPaymentStatus);
+
+// Admin routes
+router.get('/admin/all', verifyToken, authorizaRoles('admin'), getAllPayments);
+
+export default router;pymmentRoutes
+// routes/propertyRoutes.js
+import express from "express";
+import {
+  createProperty,
+  getMyProperties,
+  getOneProperty,
+  updateProperty,
+  deleteProperty,
+  assignManager,
+  removeManager,
+  getAvailableManagers
+} from "../controllers/propertyController.js";
+import { verifyToken } from "../middlewares/authMiddleware.js";
+import { authorizaRoles } from "../middlewares/roleMiddleware.js";
+
+const router = express.Router();
+
+// Property CRUD routes
+router.post(
+  "/admin/properties",
+  verifyToken,
+  authorizaRoles("admin"),
+  createProperty
+);
+
+router.get(
+  "/admin/properties",
+  verifyToken,
+  authorizaRoles("admin"),
+  getMyProperties
+);
+
+router.get(
+  "/admin/properties/:id",
+  verifyToken,
+  authorizaRoles("admin"),
+  getOneProperty
+);
+
+router.put(
+  "/admin/properties/:id",
+  verifyToken,
+  authorizaRoles("admin"),
+  updateProperty
+);
+
+router.delete(
+  "/admin/properties/:id",
+  verifyToken,
+  authorizaRoles("admin"),
+  deleteProperty
+);
+
+// Manager routes
+router.get(
+  "/admin/managers/available",
+  verifyToken,
+  authorizaRoles("admin"),
+  getAvailableManagers
+);
+
+router.post(
+  "/admin/properties/:id/assign-manager",
+  verifyToken,
+  authorizaRoles("admin"),
+  assignManager
+);
+
+router.delete(
+  "/admin/properties/:id/remove-manager",
+  verifyToken,
+  authorizaRoles("admin"),
+  removeManager
+);
+
+export default router;propertyRoutes
+// routes/unitRoutes.js
+import express from "express";
+import { verifyToken } from "../middlewares/authMiddleware.js";
+import { authorizaRoles } from "../middlewares/roleMiddleware.js";
+import {
+  createUnit,
+  getPropertyUnits,
+  updateUnit,
+  deleteUnit,
+  assignTenantToUnit,
+  removeTenantFromUnit,
+  getAvailableTenants,
+  getUnitTenant,
+  getVacantUnits
+} from "../controllers/unitController.js";
+
+const router = express.Router();
+
+// Get available tenants
+router.get(
+  "/tenants/available",
+  verifyToken,
+  authorizaRoles("admin"),
+  getAvailableTenants
+);
+
+// Get vacant units for a property
+router.get(
+  "/properties/:propertyId/units/vacant",
+  verifyToken,
+  authorizaRoles("admin"),
+  getVacantUnits
+);
+
+// Unit routes
+router.post(
+  "/properties/:propertyId/units",
+  verifyToken,
+  authorizaRoles("admin"),
+  createUnit
+);
+
+router.get(
+  "/properties/:propertyId/units",
+  verifyToken,
+  authorizaRoles("admin"),
+  getPropertyUnits
+);
+
+// Tenant assignment routes
+router.post(
+  "/properties/:propertyId/units/:unitId/assign-tenant",
+  verifyToken,
+  authorizaRoles("admin"),
+  assignTenantToUnit
+);
+
+router.delete(
+  "/properties/:propertyId/units/:unitId/remove-tenant",
+  verifyToken,
+  authorizaRoles("admin"),
+  removeTenantFromUnit
+);
+
+router.get(
+  "/properties/:propertyId/units/:unitId/tenant",
+  verifyToken,
+  authorizaRoles("admin"),
+  getUnitTenant
+);
+
+// Unit CRUD
+router.put(
+  "/properties/:propertyId/units/:unitId",
+  verifyToken,
+  authorizaRoles("admin"),
+  updateUnit
+);
+
+router.delete(
+  "/properties/:propertyId/units/:unitId",
+  verifyToken,
+  authorizaRoles("admin"),
+  deleteUnit
+);
+
+export default router;unit routes and 
+// routes/userRoutes.js
+import express from 'express';
+import { verifyToken } from '../middlewares/authMiddleware.js';
+import { authorizaRoles } from '../middlewares/roleMiddleware.js';
+import { 
+  getUsers, 
+  getOneUser, 
+  createUser, 
+  updateUser, 
+  deleteUser,
+  getUsersByRole,
+  getTenantsByProperty
+} from '../controllers/userController.js';
+
+const router = express.Router();
+
+// Test routes for role-based access
+router.get("/admin", verifyToken, authorizaRoles("admin"), (req, res) => {
+    res.json({ message: `Welcome admin` });
+});
+
+router.get("/manager", verifyToken, authorizaRoles("admin", "manager"), (req, res) => {
+    res.json({ message: `Welcome manager` });
+});
+
+router.get("/user", verifyToken, authorizaRoles("admin", "manager", "user"), (req, res) => {
+    res.json({ message: `Welcome user` });
+});
+
+// User management routes (admin only)
+router.get("/by-role/:role", verifyToken, authorizaRoles("admin"), getUsersByRole);
+router.get("/by-property/:propertyId", verifyToken, authorizaRoles("admin"), getTenantsByProperty);
+router.get("/getUsers", verifyToken, authorizaRoles("admin"), getUsers);
+router.get("/getOneUser/:id", verifyToken, authorizaRoles("admin"), getOneUser);
+router.post("/create", verifyToken, authorizaRoles("admin"), createUser);
+router.put("/update/:id", verifyToken, authorizaRoles("admin"), updateUser);
+router.delete("/delete/:id", verifyToken, authorizaRoles("admin"), deleteUser);
+
+export default router; userRoutes
+then for the folder services for mpesa we have // src/services/mpesaService.js
+import axios from 'axios';
+import { mpesaConfig } from '../config/mpesaConfig.js';
+import moment from 'moment';
+
+class MpesaService {
+  constructor() {
+    this.consumerKey = mpesaConfig.consumerKey;
+    this.consumerSecret = mpesaConfig.consumerSecret;
+    this.passKey = mpesaConfig.passKey;
+    this.shortCode = mpesaConfig.shortCode;
+    this.authUrl = mpesaConfig.authUrl;
+    this.stkUrl = mpesaConfig.stkUrl;
+    this.queryUrl = mpesaConfig.queryUrl;
+  }
+
+  // Generate access token
+  async getAccessToken() {
+    try {
+      const auth = Buffer.from(`${this.consumerKey}:${this.consumerSecret}`).toString('base64');
+      
+      const response = await axios.get(this.authUrl, {
+        headers: {
+          'Authorization': `Basic ${auth}`
+        }
+      });
+      
+      return response.data.access_token;
+    } catch (error) {
+      console.error('Error getting access token:', error.response?.data || error.message);
+      throw new Error('Failed to get M-Pesa access token');
+    }
+  }
+
+  // Generate timestamp and password for STK push
+  generateTimestampAndPassword() {
+    const timestamp = moment().format('YYYYMMDDHHmmss');
+    const password = Buffer.from(`${this.shortCode}${this.passKey}${timestamp}`).toString('base64');
+    
+    return { timestamp, password };
+  }
+
+  // Initiate STK Push
+  async stkPush(phoneNumber, amount, accountReference, transactionDesc, callbackUrl) {
+    try {
+      const token = await this.getAccessToken();
+      const { timestamp, password } = this.generateTimestampAndPassword();
+      
+      // Format phone number (remove 0 or +254, ensure 254 format)
+      const formattedPhone = this.formatPhoneNumber(phoneNumber);
+      
+      const payload = {
+        BusinessShortCode: this.shortCode,
+        Password: password,
+        Timestamp: timestamp,
+        TransactionType: 'CustomerPayBillOnline',
+        Amount: Math.round(amount),
+        PartyA: formattedPhone,
+        PartyB: this.shortCode,
+        PhoneNumber: formattedPhone,
+        CallBackURL: callbackUrl,
+        AccountReference: accountReference.substring(0, 12), // Max 12 chars
+        TransactionDesc: transactionDesc.substring(0, 13) // Max 13 chars
+      };
+
+      console.log('STK Push Payload:', payload);
+
+      const response = await axios.post(this.stkUrl, payload, {
+        headers: {
+          'Authorization': `Bearer ${token}`,
+          'Content-Type': 'application/json'
+        }
+      });
+
+      return response.data;
+    } catch (error) {
+      console.error('STK Push Error:', error.response?.data || error.message);
+      throw new Error(error.response?.data?.errorMessage || 'STK push failed');
+    }
+  }
+
+  // Query STK Push status
+  async queryStatus(checkoutRequestID) {
+    try {
+      const token = await this.getAccessToken();
+      const { timestamp, password } = this.generateTimestampAndPassword();
+      
+      const payload = {
+        BusinessShortCode: this.shortCode,
+        Password: password,
+        Timestamp: timestamp,
+        CheckoutRequestID: checkoutRequestID
+      };
+
+      const response = await axios.post(this.queryUrl, payload, {
+        headers: {
+          'Authorization': `Bearer ${token}`,
+          'Content-Type': 'application/json'
+        }
+      });
+
+      return response.data;
+    } catch (error) {
+      console.error('Query Status Error:', error.response?.data || error.message);
+      throw new Error('Failed to query transaction status');
+    }
+  }
+
+  // Format phone number to international format
+  formatPhoneNumber(phone) {
+    // Remove any non-numeric characters
+    let cleaned = phone.replace(/\D/g, '');
+    
+    // If starts with 0, replace with 254
+    if (cleaned.startsWith('0')) {
+      cleaned = '254' + cleaned.substring(1);
+    }
+    // If starts with 7, add 254
+    else if (cleaned.startsWith('7')) {
+      cleaned = '254' + cleaned;
+    }
+    // If starts with 254, keep as is
+    else if (!cleaned.startsWith('254')) {
+      cleaned = '254' + cleaned;
+    }
+    
+    return cleaned;
+  }
+}
+
+export default new MpesaService(); for mpesaServise.js and finally ther server.js we have //dependancies
+import express from 'express';
+import dotenv from 'dotenv';/*dotenv configuration*/ dotenv.config();
+import cors from 'cors';
+
+import { databaseConnection } from './src/config/dbConnection.js';
+
+//routes
+import authRoutes from './src/routes/authRoutes.js';
+import userRoutes from './src/routes/userRoutes.js';
+import propertyRoutes from './src/routes/propertyRoutes.js';
+import unitRoutes from './src/routes/unitRoutes.js';
+import paymentRoutes from './src/routes/paymentRoutes.js';
+//getting from .env file
+const port = process.env.PORT || 8000;
+console.log(`Server will run on port: ${port}`);
+
+//create express app
+const app = express();
+
+// 🔴 IMPORTANT: Order matters! CORS should come BEFORE routes
+
+// 1. First, setup CORS properly
+const corsOptions = {
+  origin: ["http://localhost:3000", "http://127.0.0.1:3000"],
+  methods: ["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"],
+  allowedHeaders: ["Content-Type", "Authorization"],
+  credentials: true,
+  optionsSuccessStatus: 200
+};
+
+app.use(cors(corsOptions));
+
+// 2. Then JSON middleware
+app.use(express.json());
+
+// 3. Debug middleware (optional - helps see incoming requests)
+app.use((req, res, next) => {
+  console.log(`🔍 Incoming request: ${req.method} ${req.url}`);
+  next();
+});
+
+// 4. Connect to database
+databaseConnection();
+
+// 5. Routes - these should come AFTER middleware
+app.use("/api/auth", authRoutes);
+app.use("/api/users", userRoutes);
+app.use("/api/properties", propertyRoutes);
+app.use("/api/units", unitRoutes);
+// Add after other routes
+app.use("/api/payments", paymentRoutes);
+// 6. Test route
+app.use("/testRoute111", (req, res) => {
+    res.send("<p>This is the test route</p>");
+});
+
+// 7. Start server
+app.listen(port, () => {
+  console.log(`✅ Server running on http://localhost:${port}`);
+  console.log(`✅ Test route: http://localhost:${port}/testRoute111`);
+  console.log(`✅ Auth route: http://localhost:${port}/api/auth/register`);
+});
