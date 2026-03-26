@@ -255,28 +255,21 @@ export const getAllPayments = async (req, res) => {
 export const queryPaymentStatus = async (req, res) => {
   try {
     const { checkoutRequestID } = req.params;
+    const result = await mpesaService.queryStatus(checkoutRequestID);
     
+    // Update the payment record with status and receipt number
     const payment = await Payment.findOne({ checkoutRequestID });
-    if (!payment) {
-      return res.status(404).json({ message: 'Payment not found' });
+    if (payment) {
+      payment.status = result.status; // 'completed', 'cancelled', 'failed'
+      if (result.MpesaReceiptNumber) {
+        payment.mpesaReceiptNumber = result.MpesaReceiptNumber;
+      }
+      await payment.save();
     }
-
-    // In test mode, return completed status
-    if (TEST_MODE) {
-      return res.status(200).json({
-        payment: { ...payment.toObject(), status: 'completed' },
-        mpesaStatus: { ResultCode: 0, ResultDesc: "Test payment completed" }
-      });
-    }
-
-    const status = await mpesaService.queryStatus(checkoutRequestID);
     
-    res.status(200).json({
-      payment,
-      mpesaStatus: status
-    });
-  } catch (error) {
-    console.error('Error querying status:', error);
+    res.json({ payment: { status: result.status } });
+  } catch (err) {
+    console.error(err);
     res.status(500).json({ message: 'Failed to query payment status' });
   }
 };

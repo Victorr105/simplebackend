@@ -4,6 +4,7 @@ import User from "../models/userModel.js";
 import multer from 'multer';
 import path from 'path';
 import fs from 'fs';
+import Payment from "../models/paymentModel.js";  
 
 // ---------- Multer configuration ----------
 const storage = multer.diskStorage({
@@ -148,10 +149,9 @@ const updateProperty = async (req, res) => {
 };
 
 // DELETE a property
-const deleteProperty = async (req, res) => {
+export const deleteProperty = async (req, res) => {
   try {
     const { id } = req.params;
-    
     const property = await Property.findOne({
       _id: id,
       propertyOwner: req.user.id,
@@ -161,23 +161,21 @@ const deleteProperty = async (req, res) => {
       return res.status(404).json({ message: "Property not found" });
     }
 
-    const unitCount = await Unit.countDocuments({ property: id });
-    
-    if (unitCount > 0) {
-      return res.status(400).json({ 
-        message: `Cannot delete this property because it has ${unitCount} units. Please delete all units first.` 
-      });
-    }
+    // Delete all units that belong to this property
+    await Unit.deleteMany({ property: id });
 
+    // Delete all payments associated with this property
+    await Payment.deleteMany({ property: id });   // adjust field name if needed
+
+    // Delete the property itself
     await Property.findByIdAndDelete(id);
     
-    res.json({ message: "Property deleted successfully" });
+    res.json({ message: "Property and all associated data deleted successfully" });
   } catch (error) {
     console.error("Delete property error:", error);
     res.status(500).json({ message: "Failed to delete property" });
   }
 };
-
 // ---------- Manager functions ----------
 const getAvailableManagers = async (req, res) => {
   try {
@@ -345,7 +343,6 @@ export {
   getMyProperties, 
   getOneProperty, 
   updateProperty, 
-  deleteProperty,
   assignManager,
   removeManager,
   getAvailableManagers,

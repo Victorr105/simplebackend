@@ -1,4 +1,3 @@
-// src/services/mpesaService.js
 import axios from 'axios';
 import { mpesaConfig } from '../config/mpesaConfig.js';
 import moment from 'moment';
@@ -123,7 +122,7 @@ class MpesaService {
     }
   }
 
-  // Query STK Push status
+  // Query STK Push status (updated with status mapping)
   async queryStatus(checkoutRequestID) {
     try {
       console.log("📡 [3/3] Querying payment status...");
@@ -144,8 +143,27 @@ class MpesaService {
         }
       });
 
-      console.log('✅ Query Status Response:', response.data);
-      return response.data;
+      const result = response.data;
+      console.log('✅ Query Status Response:', result);
+
+      // Safaricom returns ResponseCode = "0" for successful query.
+      if (result.ResponseCode !== "0") {
+        // Query itself failed (e.g., invalid token)
+        throw new Error(`Query failed: ${result.ResponseDescription}`);
+      }
+
+      // Map the ResultCode to our internal status
+      let status = 'pending';
+      if (result.ResultCode === '0') {
+        status = 'completed';
+      } else if (result.ResultCode === '1032') {
+        status = 'cancelled';
+      } else if (result.ResultCode) {
+        status = 'failed';
+      }
+
+      // Return the original result plus the derived status
+      return { status, ...result };
     } catch (error) {
       console.error('❌ Query Status Error:', error.response?.data || error.message);
       throw new Error('Failed to query transaction status');
