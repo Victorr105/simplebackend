@@ -69,7 +69,7 @@ app.use("/testRoute111", (req, res) => {
 });
 
 // 8. Start server
-app.listen(5000, () => {
+app.listen(port, () => {
   console.log(`✅ Server running on http://localhost:${port}`);
   console.log(`✅ Test route: http://localhost:${port}/testRoute111`);
   console.log(`✅ Auth route: http://localhost:${port}/api/auth/register`);
